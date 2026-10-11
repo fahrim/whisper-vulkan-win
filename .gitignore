@@ -1,0 +1,16 @@
+# Build output
+build/
+build*/
+dist/
+spirv-headers/
+spirv-headers-*/
+spirv-headers-install/
+
+# Vendored upstream sources, fetched by the build
+whisper.cpp/
+
+# Release artifacts
+*.zip
+SHA256SUMS.txt
+
+.DS_Store

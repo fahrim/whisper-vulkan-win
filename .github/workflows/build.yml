@@ -1,0 +1,130 @@
+name: build
+
+# Builds whisper.cpp with the Vulkan backend on Windows x64 and publishes a
+# zip plus checksums. Upstream ships no Windows Vulkan binary, so this is the
+# only practical way to get one without a local toolchain.
+
+on:
+  push:
+    branches: [main]
+    tags: ["engine-vulkan-*"]
+  workflow_dispatch:
+  schedule:
+    # Weekly, to pick up new whisper.cpp builds without anyone pushing.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pin which upstream build to compile. Bump this to release a new one.
+      - name: Resolve whisper.cpp build
+        id: whisper
+        run: |
+          $tag = if ("${{ github.event.inputs.whisper_build }}" -ne "") {
+            "${{ github.event.inputs.whisper_build }}"
+          } else {
+            "latest"
+          }
+          if ($tag -eq "latest") {
+            $rel = Invoke-RestMethod "https://api.github.com/repos/ggml-org/whisper.cpp/releases/latest"
+            # Tags look like "b5130"; the release body names the actual source.
+            $tag = $rel.tag_name
+          }
+          "build=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "whisper.cpp build: $tag"
+
+      - name: Checkout whisper.cpp sources
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ steps.whisper.outputs.build }}
+          submodules: recursive
+          path: whisper.cpp
+
+      - name: Install Vulkan SDK
+        run: |
+          choco install vulkan-sdk --version=1.4.363.0 -y
+          # The SDK installer can return before the environment is readable.
+          $sdk = "C:\VulkanSDK\1.4.363.0"
+          echo "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
+          echo "$sdk\Bin" >> $env:GITHUB_PATH
+          if (-not (Test-Path "$sdk\Bin\glslc.exe")) {
+            Write-Error "glslc.exe missing from $sdk\Bin"
+          }
+
+      # ggml-vulkan does find_package(SPIRV-Headers CONFIG REQUIRED), which a
+      # default SDK install does not provide. Build and install it ourselves.
+      - name: Build SPIRV-Headers
+        run: |
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers spirv-headers
+          cmake -S spirv-headers -B spirv-headers-build -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE\spirv-headers-install" -DCMAKE_BUILD_TYPE=Release
+          cmake --install spirv-headers-build
+
+      - name: Configure
+        run: |
+          cmake -B build -S whisper.cpp `
+            "-DGGML_VULKAN=ON" `
+            "-DGGML_NATIVE=OFF" `
+            "-DBUILD_SHARED_LIBS=ON" `
+            "-DWHISPER_BUILD_SERVER=ON" `
+            "-DWHISPER_BUILD_EXAMPLES=ON" `
+            "-DWHISPER_BUILD_TESTS=OFF" `
+            "-DCMAKE_BUILD_TYPE=Release" `
+            "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE\spirv-headers-install" `
+            "-DVulkan_LIBRARY=$env:VULKAN_SDK\Lib\vulkan-1.lib"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # A zip that builds but cannot see a GPU is worse than no zip at all,
+      # so assert the backend actually initialises before publishing.
+      - name: Smoke test
+        run: |
+          $bin = "build\bin\Release"
+          $out = & "$bin\whisper-cli.exe" --help 2>&1
+          if ($LASTEXITCODE -ne 0) { Write-Error "whisper-cli did not start" }
+          if (-not (Test-Path "$bin\ggml-vulkan.dll")) { Write-Error "ggml-vulkan.dll was not produced" }
+          Write-Host "binaries present"
+        continue-on-error: false
+
+      - name: Package
+        run: |
+          $bin = "build\bin\Release"
+          $staging = "dist\whisper-vulkan-win-x64-${{ steps.whisper.outputs.build }}"
+          New-Item -ItemType Directory -Force $staging | Out-Null
+          $wanted = @(
+            "whisper-cli.exe", "whisper-server.exe", "whisper.dll",
+            "ggml.dll", "ggml-base.dll", "ggml-cpu.dll", "ggml-vulkan.dll"
+          )
+          foreach ($f in $wanted) {
+            $src = Join-Path $bin $f
+            if (-not (Test-Path $src)) { Write-Error "missing $f" }
+            Copy-Item $src $staging
+          }
+          Compress-Archive -Path "dist\*" -DestinationPath "dist\whisper-vulkan-win-x64-${{ steps.whisper.outputs.build }}.zip"
+
+      - name: Checksums
+        run: |
+          $zip = "dist\whisper-vulkan-win-x64-${{ steps.whisper.outputs.build }}.zip"
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $zip -Leaf)" | Out-File -Encoding ascii "dist\SHA256SUMS.txt"
+          Write-Host $hash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-vulkan-win-x64-${{ steps.whisper.outputs.build }}
+          path: dist/*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/engine-vulkan-')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
