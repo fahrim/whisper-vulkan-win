@@ -1,14 +1,21 @@
 name: build
 
-# Builds whisper.cpp with the Vulkan backend on Windows x64 and publishes a
-# zip plus checksums. Upstream ships no Windows Vulkan binary, so this is the
-# only practical way to get one without a local toolchain.
+# Builds whisper.cpp for Windows x64 as two self-contained server binaries:
+# one with the Vulkan backend, one processor-only. Upstream ships no Windows
+# Vulkan binary, so this is the only practical way to get one without a
+# local toolchain. Both are built with BUILD_SHARED_LIBS=OFF and /MT, so a
+# clean machine without the Visual C++ redistributable can still start them.
 
 on:
   push:
     branches: [main]
     tags: ["engine-vulkan-*"]
   workflow_dispatch:
+    inputs:
+      whisper_build:
+        description: "whisper.cpp release tag (leave empty for latest)"
+        required: false
+        default: ""
   schedule:
     # Weekly, to pick up new whisper.cpp builds without anyone pushing.
     - cron: "0 6 * * 1"
@@ -22,18 +29,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pin which upstream build to compile. Bump this to release a new one.
+      # Pin which upstream build to compile. A tag build is immutable, so
+      # it must not resolve "latest" at build time: engine-vulkan-b5454-static
+      # ships whisper.cpp v1.9.5, and rebuilding that tag years later has to
+      # produce the same source. Manual runs may name a tag; scheduled runs
+      # follow upstream deliberately.
       - name: Resolve whisper.cpp build
         id: whisper
         run: |
-          $tag = if ("${{ github.event.inputs.whisper_build }}" -ne "") {
-            "${{ github.event.inputs.whisper_build }}"
-          } else {
-            "latest"
+          $tag = "${{ github.event.inputs.whisper_build }}"
+          if (-not $tag -and "${{ github.ref }}" -like "refs/tags/*") {
+            $tag = "v1.9.5"
           }
-          if ($tag -eq "latest") {
+          if (-not $tag) {
             $rel = Invoke-RestMethod "https://api.github.com/repos/ggml-org/whisper.cpp/releases/latest"
-            # Tags look like "b5130"; the release body names the actual source.
             $tag = $rel.tag_name
           }
           "build=$tag" >> $env:GITHUB_OUTPUT
@@ -58,56 +67,18 @@ jobs:
             Write-Error "glslc.exe missing from $sdk\Bin"
           }
 
-      # ggml-vulkan does find_package(SPIRV-Headers CONFIG REQUIRED), which a
-      # default SDK install does not provide. Build and install it ourselves.
-      - name: Build SPIRV-Headers
+      # One script for local and CI. It builds SPIRV-Headers, configures and
+      # compiles both backends, stages the package, and runs the import
+      # guard against the staged bytes.
+      - name: Build the runtime
         run: |
-          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers spirv-headers
-          cmake -S spirv-headers -B spirv-headers-build -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE\spirv-headers-install" -DCMAKE_BUILD_TYPE=Release
-          cmake --install spirv-headers-build
-
-      - name: Configure
-        run: |
-          cmake -B build -S whisper.cpp `
-            "-DGGML_VULKAN=ON" `
-            "-DGGML_NATIVE=OFF" `
-            "-DBUILD_SHARED_LIBS=ON" `
-            "-DWHISPER_BUILD_SERVER=ON" `
-            "-DWHISPER_BUILD_EXAMPLES=ON" `
-            "-DWHISPER_BUILD_TESTS=OFF" `
-            "-DCMAKE_BUILD_TYPE=Release" `
-            "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE\spirv-headers-install" `
-            "-DVulkan_LIBRARY=$env:VULKAN_SDK\Lib\vulkan-1.lib"
-
-      - name: Build
-        run: cmake --build build --config Release --parallel
-
-      # A zip that builds but cannot see a GPU is worse than no zip at all,
-      # so assert the backend actually initialises before publishing.
-      - name: Smoke test
-        run: |
-          $bin = "build\bin\Release"
-          $out = & "$bin\whisper-cli.exe" --help 2>&1
-          if ($LASTEXITCODE -ne 0) { Write-Error "whisper-cli did not start" }
-          if (-not (Test-Path "$bin\ggml-vulkan.dll")) { Write-Error "ggml-vulkan.dll was not produced" }
-          Write-Host "binaries present"
-        continue-on-error: false
+          .\build.ps1 -BuildDir build-vulkan -CpuBuildDir build-cpu -DistDir dist\runtime
 
       - name: Package
         run: |
-          $bin = "build\bin\Release"
-          $staging = "dist\whisper-vulkan-win-x64-${{ steps.whisper.outputs.build }}"
-          New-Item -ItemType Directory -Force $staging | Out-Null
-          $wanted = @(
-            "whisper-cli.exe", "whisper-server.exe", "whisper.dll",
-            "ggml.dll", "ggml-base.dll", "ggml-cpu.dll", "ggml-vulkan.dll"
-          )
-          foreach ($f in $wanted) {
-            $src = Join-Path $bin $f
-            if (-not (Test-Path $src)) { Write-Error "missing $f" }
-            Copy-Item $src $staging
-          }
-          Compress-Archive -Path "dist\*" -DestinationPath "dist\whisper-vulkan-win-x64-${{ steps.whisper.outputs.build }}.zip"
+          $zip = "dist\whisper-vulkan-win-x64-${{ steps.whisper.outputs.build }}.zip"
+          Compress-Archive -Path "dist\runtime\*" -DestinationPath $zip
+          Get-ChildItem "dist\runtime" | Select-Object Name, Length
 
       - name: Checksums
         run: |

@@ -6,6 +6,8 @@ Upstream publishes Windows builds for **CUDA** and plain **CPU**. That leaves ev
 
 These are unmodified builds of official whisper.cpp sources, compiled in CI with `-DGGML_VULKAN=ON`. No patched code, no bundled surprises.
 
+Each release carries two single executables: a Vulkan build and a processor-only build. Both are linked with the static MSVC runtime (`/MT`) and `BUILD_SHARED_LIBS=OFF`, so they do not need the Visual C++ redistributable. `vcomp140.dll` travels beside them because OpenMP is still the faster processor path; it imports only `KERNEL32.dll`, so it brings no CRT of its own.
+
 ## Why Vulkan
 
 One backend covers the GPUs CUDA does not:
@@ -39,34 +41,34 @@ Get-FileHash whisper-vulkan-win-x64-*.zip -Algorithm SHA256
 
 Compare against `SHA256SUMS.txt` on the same release page.
 
-> **Requires an AVX2 CPU** (roughly 2013 or newer) — `GGML_NATIVE=OFF` still
-> targets a baseline. On older CPUs the binary exits immediately; use a
-> CPU-only upstream build instead.
+> **Requires an AVX2 CPU** (roughly 2013 or newer) — `GGML_NATIVE=OFF` picks a
+> portable baseline, but that baseline includes AVX2. Both executables carry
+> the same requirement. On older CPUs, use upstream's generic CPU build.
 
-> **Requires a Vulkan driver.** AMD Adrenalin, Intel's Windows driver, and
-> NVIDIA's driver all ship one. Nothing extra to install. Check yours with
-> `vulkaninfo` from the Vulkan SDK, or just run `whisper-cli.exe --help` and
-> watch for a device line.
+> **Requires a Vulkan driver for the accelerated build.** AMD Adrenalin,
+> Intel's Windows driver, and NVIDIA's driver all ship one. Nothing extra to
+> install. Check yours with `vulkaninfo` from the Vulkan SDK, or just run
+> `whisper-server.exe --help` and watch for a device line. The processor
+> build has no such requirement.
 
 ## What is in the zip
 
 ```
-whisper-cli.exe      transcription from the command line
-whisper-server.exe   HTTP server, incl. an OpenAI-compatible /inference
-whisper.dll
-ggml.dll             base dispatch
-ggml-cpu.dll         CPU fallback, used for work the GPU cannot take
-ggml-vulkan.dll      the Vulkan backend
-ggml-base.dll
+whisper-server.exe       HTTP server with the Vulkan backend
+whisper-server-cpu.exe   HTTP server with the processor backend
+vcomp140.dll             OpenMP runtime, imported by both
 ```
+
+No `whisper.dll`, no `ggml*.dll`, and no Visual C++ runtime DLLs. A clean
+machine can unpack the zip and run either executable.
 
 ## Quick check
 
 ```powershell
-whisper-cli.exe -m <model>.bin -f <audio>.wav -l tr -nt -np
+whisper-server.exe --model <model>.bin --host 127.0.0.1 --port 8811
 ```
 
-A healthy run starts with:
+A healthy Vulkan start prints:
 
 ```
 ggml_vulkan: Found 1 Vulkan devices:
@@ -74,7 +76,9 @@ ggml_vulkan: 0 = <your GPU> | fp16: 1 | bf16: 1 | ...
 ```
 
 If that line says `Found 0 Vulkan devices`, the driver is the problem, not the
-build. Update your GPU driver.
+build. Update your GPU driver. If the accelerated executable will not start at
+all, run `whisper-server-cpu.exe` instead: the processor build is the honest
+floor.
 
 ## Models
 
@@ -85,10 +89,10 @@ curl.exe -L -o ggml-large-v3-turbo-q5_0.bin `
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
 ```
 
-**Pass `-l` explicitly.** With no language hint, Whisper auto-detects, which
-both costs roughly twice the transcription time and gets Turkish wrong — it
-reads a Turkish recording as English and returns Latin-script nonsense. Use
-`-l tr`, `-l en`, and so on.
+**Pass `--language` explicitly.** With no language hint, Whisper auto-detects,
+which both costs roughly twice the transcription time and gets Turkish wrong —
+it reads a Turkish recording as English and returns Latin-script nonsense. Use
+`--language tr`, `--language en`, and so on.
 
 ## Building it yourself
 
@@ -96,35 +100,34 @@ The point of keeping this public. On Windows:
 
 1. Install [CMake](https://cmake.org/download/), the
    [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) and Visual Studio 2022.
-2. Fetch whisper.cpp with its submodules (`git clone --recursive`).
-3. Configure and build:
+2. Fetch whisper.cpp with its submodules next to this repository:
 
 ```powershell
-$env:VULKAN_SDK = "C:\VulkanSDK\1.4.363.0"
-$env:PATH = "$env:VULKAN_SDK\Bin;$env:PATH"
-
-cmake -B build -S . `
-  -DGGML_VULKAN=ON `
-  -DGGML_NATIVE=OFF `
-  -DBUILD_SHARED_LIBS=ON `
-  -DWHISPER_BUILD_SERVER=ON `
-  -DWHISPER_BUILD_TESTS=OFF `
-  -DCMAKE_BUILD_TYPE=Release `
-  -DVulkan_LIBRARY="$env:VULKAN_SDK\Lib\vulkan-1.lib"
-
-cmake --build build --config Release --parallel
+git clone --recursive https://github.com/ggml-org/whisper.cpp
 ```
+
+3. Run the build script:
+
+```powershell
+.\build.ps1
+```
+
+It builds SPIRV-Headers, configures both backends with `BUILD_SHARED_LIBS=OFF`
+and `CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`, verifies the import tables,
+smoke-tests both executables, and stages the three files in `dist\runtime`.
+The same script is what CI runs, so a local success and a release build mean
+the same thing.
 
 Two notes if the configure step fails:
 
 - The import library is `vulkan-1.lib`, not `vulkan.lib`, and not every SDK
   layout ships one. Point `Vulkan_LIBRARY` at whichever exists.
 - `ggml-vulkan` calls `find_package(SPIRV-Headers CONFIG REQUIRED)`. A default
-  Vulkan SDK install does not ship that CMake config. Build and install
-  [SPIRV-Headers](https://github.com/KhronosGroup/SPIRV-Headers), then pass
-  `-DCMAKE_PREFIX_PATH=<install-prefix>`.
+  Vulkan SDK install does not ship that CMake config. The script builds and
+  installs [SPIRV-Headers](https://github.com/KhronosGroup/SPIRV-Headers) for
+  you.
 
-See `.github/workflows/build.yml` for the exact sequence CI runs.
+See `.github/workflows/build.yml` for the release sequence.
 
 ## License
 
