@@ -240,6 +240,12 @@ if ($LASTEXITCODE -ne 0) { Say "Vulkan import check failed"; exit 1 }
 & "$PSScriptRoot\verify-imports.ps1" `
     -Binary (Join-Path $DistDir "whisper-server-cpu.exe") -OpenMP
 if ($LASTEXITCODE -ne 0) { Say "processor import check failed"; exit 1 }
+# The OpenMP runtime is shipped beside the engines, so it is part of the
+# clean-machine promise too. A vcomp140 that pulled in the CRT would fail
+# exactly where the static executables were meant to remove the failure.
+& "$PSScriptRoot\verify-imports.ps1" `
+    -Binary (Join-Path $DistDir "vcomp140.dll")
+if ($LASTEXITCODE -ne 0) { Say "OpenMP runtime import check failed"; exit 1 }
 
 # ---- smoke test -----------------------------------------------------------
 foreach ($name in @("whisper-server.exe", "whisper-server-cpu.exe")) {
