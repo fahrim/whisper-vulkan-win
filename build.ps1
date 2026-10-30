@@ -132,9 +132,12 @@ if (-not (Test-Path $SourceDir)) {
     exit 1
 }
 
-# The static CRT is an MSVC property, and the package is x64. Naming the
-# generator makes the build the same in CI and on a developer machine.
-$generator = @("-G", "Visual Studio 17 2022", "-A", "x64")
+# Let CMake choose the installed Visual Studio generator. Naming one by
+# version made the script fail on a runner that had moved to a newer
+# Visual Studio, and the generator does not change the bytes in a way the
+# import guard and smoke test do not already cover. The host is x64, so
+# the default architecture is the one this package ships.
+$generator = @()
 
 # ---- SPIRV-Headers --------------------------------------------------------
 $spvInstall = "$PSScriptRoot\spirv-headers-install"
@@ -193,8 +196,12 @@ Say "Compiling the Vulkan build with $Jobs jobs (this takes a few minutes)..."
 & cmake --build $BuildDir --config Release --target whisper-server --parallel $Jobs
 if ($LASTEXITCODE -ne 0) { Say "Vulkan build failed"; exit 1 }
 
-$vulkanServer = Join-Path $BuildDir "bin\Release\whisper-server.exe"
-if (-not (Test-Path $vulkanServer)) {
+# Multi-config generators put the executable under bin\Release; a
+# single-config generator puts it under bin. Find it rather than assume,
+# so the script works with whichever generator CMake selected.
+$vulkanServer = Get-ChildItem (Join-Path $BuildDir "bin") -Recurse -Filter whisper-server.exe `
+    -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $vulkanServer) {
     Say "Vulkan build did not produce whisper-server.exe"
     exit 1
 }
@@ -209,8 +216,9 @@ Say "Compiling the processor build with $Jobs jobs..."
 & cmake --build $CpuBuildDir --config Release --target whisper-server --parallel $Jobs
 if ($LASTEXITCODE -ne 0) { Say "processor build failed"; exit 1 }
 
-$cpuServer = Join-Path $CpuBuildDir "bin\Release\whisper-server.exe"
-if (-not (Test-Path $cpuServer)) {
+$cpuServer = Get-ChildItem (Join-Path $CpuBuildDir "bin") -Recurse -Filter whisper-server.exe `
+    -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $cpuServer) {
     Say "processor build did not produce whisper-server.exe"
     exit 1
 }
@@ -218,8 +226,8 @@ if (-not (Test-Path $cpuServer)) {
 # ---- stage ----------------------------------------------------------------
 if (Test-Path $DistDir) { Remove-Item $DistDir -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
-Copy-Item $vulkanServer (Join-Path $DistDir "whisper-server.exe")
-Copy-Item $cpuServer (Join-Path $DistDir "whisper-server-cpu.exe")
+Copy-Item $vulkanServer.FullName (Join-Path $DistDir "whisper-server.exe")
+Copy-Item $cpuServer.FullName (Join-Path $DistDir "whisper-server-cpu.exe")
 $vcomp = Find-Vcomp
 Copy-Item $vcomp (Join-Path $DistDir "vcomp140.dll")
 Say "vcomp: $vcomp"
